@@ -1,0 +1,230 @@
+#!/bin/bash
+#
+# Copyright (C) 2018-19 artoo@artixlinux.org
+# Copyright (C) 2018 Artix Linux Developers
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+m4_include(lib/util-base.sh)
+m4_include(lib/util-pkg.sh)
+m4_include(lib/base/message.sh)
+m4_include(lib/pkg/common.sh)
+m4_include(lib/pkg/git.sh)
+m4_include(lib/pkg/gitea.sh)
+m4_include(lib/pkg/repo.sh)
+
+#{{{ functions
+
+push_tree(){
+    local tree="$1"
+    msg "Update (%s)" "${tree}"
+    git push origin master
+}
+
+subrepo_push(){
+    local pkg="$1"
+    msg2 "Subrepo push (%s)" "$pkg"
+    git subrepo push "$pkg" || die "%s push failed" "$pkg"
+}
+
+subrepo_clean(){
+    local pkg="$1"
+    msg2 "Subrepo clean (%s)" "$pkg"
+    git subrepo clean "$pkg"
+}
+
+subrepo_pull(){
+    local pkg="$1"
+    msg2 "Subrepo pull (%s)" "$pkg"
+    git subrepo pull "$pkg"
+}
+
+check_rebuild(){
+    if [[ -d "$CARCH"/"${valid_names[10]}" ]] \
+    && [[ "${repo_dest}" == "${valid_names[7]}" ]]; then
+        git rm -r "$CARCH"/"${valid_names[10]}"
+        git commit -m "switch from ${valid_names[10]} to ${valid_names[7]}"
+    elif [[ -d "$CARCH"/"${valid_names[7]}" ]] \
+    && [[ "${repo_dest}" == "${valid_names[10]}" ]]; then
+        git rm -r "$CARCH"/"${valid_names[7]}"
+        git commit -m "switch from ${valid_names[7]} to ${valid_names[10]}"
+    fi
+}
+
+check_team(){
+    if [[ "${repo_src}" == "${valid_names[0]}" && "${repo_dest}" == "${valid_names[1]}" ]] || \
+        [[ "${repo_src}" == "${valid_names[1]}" && "${repo_dest}" == "${valid_names[0]}" ]] || \
+        [[ "${repo_src}" == "${valid_names[1]}" && "${repo_dest}" == "${valid_names[2]}" ]] || \
+        [[ "${repo_src}" == "${valid_names[2]}" && "${repo_dest}" == "${valid_names[1]}" ]] || \
+        [[ "${repo_src}" == "${valid_names[0]}" && "${repo_dest}" == "${valid_names[2]}" ]] || \
+        [[ "${repo_src}" == "${valid_names[2]}" && "${repo_dest}" == "${valid_names[0]}" ]]; then
+
+        local org gitname
+        org=$(get_pkg_org "${package}")
+        gitname=$(get_compliant_name "${package}")
+        add_team_to_repo "$gitname" "${org}" "${repo_dest}"
+        remove_team_from_repo "$gitname" "${org}" "${repo_src}"
+    fi
+}
+
+path_config() {
+    [[ "${repo_src}" != 'trunk' ]] && pkgbuild="$CARCH/${repo_src}"/PKGBUILD
+
+    # shellcheck disable=1090
+    . "$pkgbuild"
+}
+
+get_repo_commit_msg() {
+    echo "[${repo_src}] -> [${repo_dest}] '${package}-$(get_full_version)' ${action}"
+}
+
+get_commit_msg() {
+    echo "[${repo_src}] '${package}-$(get_full_version)' ${action}"
+}
+
+commit_pkg() {
+    local commit_msg pkg
+    if ${remove}; then
+        action='remove'
+        commit_msg=$(get_commit_msg)
+        msg "Action: %s" "$commit_msg"
+        if [[ "${repo_src}" == 'trunk' ]];then
+            git rm -r trunk
+        else
+            git rm -r "$CARCH/${repo_src}"
+        fi
+    else
+        action='modify'
+        commit_msg=$(get_commit_msg)
+        msg "Action: %s" "$commit_msg"
+        git add .
+    fi
+    git commit -m "$commit_msg"
+}
+
+repo_commit_pkg() {
+    local commit_msg
+
+    [[ -d "$CARCH/${repo_dest}" ]] && git rm -r "$CARCH/${repo_dest}"
+    [[ ! -d "$CARCH" ]] && mkdir "$CARCH"
+    [[ ! -d "$CARCH/${repo_dest}" ]] && mkdir "$CARCH/${repo_dest}"
+
+    if [[ "${repo_src}" == 'trunk' ]]; then
+        action='add'
+        commit_msg=$(get_repo_commit_msg)
+        msg "Action: %s" "$commit_msg"
+        check_rebuild
+        cp trunk/* "$CARCH/${repo_dest}"/
+    else
+        action='move'
+        [[ ! -f $pkgbuild ]] && die "%s does not exist!" "$pkgbuild"
+        commit_msg=$(get_repo_commit_msg)
+        msg "Action: %s" "$commit_msg"
+        cp "$CARCH/${repo_src}"/* "$CARCH/${repo_dest}"/
+        git rm -r "$CARCH/${repo_src}"
+    fi
+    git add .
+    git commit -m "$commit_msg"
+}
+
+run(){
+    local artixpath head group
+    artixpath=$(find_pkg "${TREE_DIR_ARTIX}" "${package}")
+    if [[ -n ${artixpath} ]];then
+        group=${artixpath%/*}
+        cd "${group}" || return
+        head=$(get_local_head)
+
+        cd "${artixpath}" || return
+
+        path_config
+
+        if [[ "${cmd}" == 'commitpkg' ]];then
+            commit_pkg
+        else
+            repo_commit_pkg
+        fi
+
+        cd "${group}" || return
+
+        ${push} && pull_tree "${group##*/}" "$head"
+#         subrepo_pull "${package}"
+        subrepo_push "${package}"
+        subrepo_clean "${package}"
+
+        ${push} && push_tree "${group##*/}"
+
+        git prune
+
+        [[ "${cmd}" != 'commitpkg' ]] && check_team
+    else
+        die "Package '%s' does not exist!" "${package}"
+    fi
+}
+
+is_valid_repo(){
+    local _valid=trunk
+    for repo in "${valid_names[@]}"; do
+        _valid=${repo:-}${repo:+|}$_valid
+    done
+    eval "case ${repo_src} in
+        ${_valid}) return 0 ;;
+        *) return 1 ;;
+    esac"
+}
+
+#}}}
+
+load_makepkg_config
+
+load_valid_names
+
+repo_src='trunk'
+package=''
+remove=false
+push=false
+
+pkgbuild=trunk/PKGBUILD
+
+cmd=${0##*/}
+repo_dest=${cmd%pkg}
+
+usage() {
+    echo "Usage: ${0##*/} [options]"
+    echo "    -s <name>          Source repository [default:${repo_src}]"
+    echo '    -p <pkg>           Package name'
+    echo '    -r                 Delete from repo (commitpkg only)'
+    echo '    -u                 Push'
+    echo '    -h                 This help'
+    echo ''
+    echo ''
+    exit "$1"
+}
+
+opts='p:s:urh'
+
+while getopts "${opts}" arg; do
+    case "${arg}" in
+        s) repo_src="$OPTARG" ;;
+        p) package="$OPTARG" ;;
+        r) remove=true ;;
+        u) push=true ;;
+        h|?) usage 0 ;;
+        *) echo "invalid argument '${arg}'"; usage 1 ;;
+    esac
+done
+
+shift $(( OPTIND - 1 ))
+
+if is_valid_repo;then
+    run
+else
+    die "source repository '%s' is not valid!" "${repo_src}"
+fi

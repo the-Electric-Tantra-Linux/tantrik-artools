@@ -1,0 +1,151 @@
+#!/bin/bash
+#
+# Copyright (C) 2018-19 artoo@artixlinux.org
+# Copyright (C) 2018 Artix Linux Developers
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+shopt -s extglob
+
+m4_include(lib/base/message.sh)
+m4_include(lib/base/chroot.sh)
+m4_include(lib/base/mount.sh)
+
+#{{{ functions
+
+chroot_part_mount() {
+    msg2 "mount: [%s]" "$2"
+    mount "$@" && CHROOT_ACTIVE_PART_MOUNTS=("$2" "${CHROOT_ACTIVE_PART_MOUNTS[@]}")
+}
+
+chroot_part_umount() {
+    chroot_api_umount
+    msg2 "umount: [%s]" "${CHROOT_ACTIVE_PART_MOUNTS[@]}"
+    umount "${CHROOT_ACTIVE_PART_MOUNTS[@]}"
+    unset CHROOT_ACTIVE_PART_MOUNTS
+}
+
+detect(){
+    local detected
+    detected="$(os-prober | tr ' ' '_' | paste -s -d ' ')"
+    echo "${detected}"
+}
+
+# $1: os-prober array
+get_os_name(){
+    local str=$1
+    str="${str#*:}"
+    str="${str#*:}"
+    str="${str%:*}"
+    echo "$str"
+}
+
+mount_os(){
+    CHROOT_ACTIVE_PART_MOUNTS=()
+    CHROOT_ACTIVE_MOUNTS=()
+
+    trap_setup chroot_part_umount
+
+    chroot_part_mount "$2" "$1"
+
+    local mounts
+    mounts=$(perl -ane 'printf("%s:%s\n", @F[0,1]) if $F[0] =~ m#^UUID=#;' "$1"/etc/fstab)
+
+    for entry in ${mounts}; do
+        entry=${entry//UUID=}
+        local dev=${entry%:*} mp=${entry#*:}
+        case "${entry#*:}" in
+            '/'|'swap'|'none') continue ;;
+            *) chroot_part_mount "/dev/disk/by-uuid/${dev}" "$1${mp}" ;;
+        esac
+    done
+
+    chroot_setup "$1" true
+    chroot_add_resolv_conf "$1"
+}
+
+select_os(){
+    local os_list=( "$(detect)" ) count=${#os_list[@]}
+    if [[ ${count} -gt 1 ]];then
+        msg "Detected systems:"
+        local i=0
+        for os in "${os_list[@]}"; do
+            local last=${os##*:}
+            case $last in
+                'efi') count=$((count-1)) ;;
+                *) msg2 "$i) $(get_os_name "$os")"; i=$((i+1)) ;;
+            esac
+        done
+        i=0
+        msg "Select system to mount [0-%s] : " "$((count-1))"
+        read -r select
+    else
+        select=0
+    fi
+    local os_str=${os_list[$select]} type
+    type=$os_str
+    root=${os_str%%:*}
+    type=${type##*:}
+    if [[ "${type##*:}" == 'linux' ]];then
+        msg "Mounting (%s) [%s]" "$(get_os_name "$os_str")" "$root"
+        mount_os "$1" "$root"
+    else
+        die "You can't mount %s!" "$select"
+    fi
+}
+
+#}}}
+
+automount=false
+
+usage() {
+    echo "usage: ${0##*/} -a [or] ${0##*/} chroot-dir [command]"
+    echo '    -a             Automount detected linux system'
+    echo '    -h             Print this help message'
+    echo ''
+    echo "    If 'command' is unspecified, ${0##*/} will launch /bin/sh."
+    echo ''
+    echo "    If 'automount' is true, ${0##*/} will launch /bin/bash"
+    echo "    and ${chrootdir}."
+    echo ''
+    echo ''
+    exit "$1"
+}
+
+opts=':ha'
+
+while getopts ${opts} arg; do
+    case "${arg}" in
+        a) automount=true ;;
+        h|?) usage 0 ;;
+        *) echo "invalid argument ${arg}"; usage 1 ;;
+    esac
+done
+shift $(( OPTIND - 1 ))
+
+check_root
+
+if ${automount};then
+    chrootdir=/mnt
+    run_args=(/bin/bash)
+
+    select_os "${chrootdir}"
+else
+    chrootdir=$1
+    shift
+    run_args=("$@")
+
+    [[ -d ${chrootdir} ]] || die "Can't create chroot on non-directory %s" "${chrootdir}"
+
+    chroot_api_mount "${chrootdir}" || die "failed to setup API filesystems in chroot %s" "${chrootdir}"
+    chroot_add_resolv_conf "${chrootdir}"
+fi
+
+SHELL=/bin/sh unshare --fork --pid chroot "${chrootdir}" "${run_args[@]}"

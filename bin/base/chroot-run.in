@@ -1,0 +1,181 @@
+#!/bin/bash
+#
+# Copyright (C) 2018-19 artoo@artixlinux.org
+# Copyright (C) 2018 Artix Linux Developers
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+m4_include(lib/base/message.sh)
+m4_include(lib/base/mount.sh)
+m4_include(lib/base/chroot.sh)
+m4_include(lib/base/chroot-version.sh)
+
+# $1: chroot
+kill_chroot_process(){
+    local prefix="$1" flink pid name
+    for root_dir in /proc/*/root; do
+        flink=$(readlink "$root_dir")
+        if [ "x$flink" != "x" ]; then
+            if [ "x${flink:0:${#prefix}}" = "x$prefix" ]; then
+                # this process is in the chroot...
+                pid=$(basename "$(dirname "$root_dir")")
+                name=$(ps -p "$pid" -o comm=)
+                msg2 "Killing chroot process: %s (%s)" "$name" "$pid"
+                kill -9 "$pid"
+            fi
+        fi
+    done
+    sleep 1
+}
+
+# umask might have been changed in /etc/profile
+# ensure that sane default is set again
+umask 0022
+
+working_dir=''
+files=()
+
+mount_args=("-B:/etc/hosts:/etc/hosts")
+
+usage() {
+    echo "Usage: ${0##*/} [options] working-dir [run arguments]"
+    echo "A wrapper around chroot. Provides support for pacman."
+    echo
+    echo ' options:'
+    echo '    -C <file>     Location of a pacman config file'
+    echo '    -M <file>     Location of a makepkg config file'
+    echo '    -c <dir>      Set pacman cache'
+    echo '    -f <file>     Copy file from the host to the chroot'
+    echo '    -s            Do not run setarch'
+    echo '    -b <list>     Bind mountargs'
+    echo '                  List format [mntarg1:src1:dest1 ... mntargN:srcN:destN]'
+    echo '    -h            This message'
+    exit 1
+}
+
+opts='hC:M:c:b:f:s'
+
+while getopts ${opts} arg; do
+    case "${arg}" in
+        C) pacman_conf="$OPTARG" ;;
+        M) makepkg_conf="$OPTARG" ;;
+        c) cache_dirs+=("$OPTARG") ;;
+        f) files+=("$OPTARG") ;;
+        s) nosetarch=1 ;;
+        b) bindmounts+=("$OPTARG"); mount_args+=(${bindmounts[@]}) ;;
+        h|?) usage ;;
+        *) error "invalid argument '$arg'"; usage ;;
+    esac
+done
+shift $(( OPTIND - 1 ))
+
+(( $# < 1 )) && die 'You must specify a directory.'
+
+check_root
+
+working_dir=$(readlink -f "$1")
+shift 1
+
+[[ -z $working_dir ]] && die 'Please specify a working directory.'
+
+if (( ${#cache_dirs[@]} == 0 )); then
+    mapfile -t cache_dirs < <(pacman-conf --config "${pac_conf:-$working_dir/etc/pacman.conf}" CacheDir)
+fi
+
+# shellcheck disable=2016
+host_mirrors=($(pacman-conf --repo world Server 2> /dev/null | sed -r 's#(.*/)world/os/.*#\1$repo/os/$arch#'))
+
+for host_mirror in "${host_mirrors[@]}"; do
+    if [[ $host_mirror == *file://* ]]; then
+        # shellcheck disable=2016
+        host_mirror=$(echo "$host_mirror" | sed -r 's#file://(/.*)/\$repo/os/\$arch#\1#g')
+        in_array "$host_mirror" "${cache_dirs[@]}" || cache_dirs+=("$host_mirror")
+    fi
+done
+
+while read -r line; do
+    # shellcheck disable=2016
+    mapfile -t lines < <(pacman-conf --config "${pac_conf:-$working_dir/etc/pacman.conf}" \
+        --repo "$line" Server | sed -r 's#(.*/)[^/]+/os/.+#\1#')
+    for line in "${lines[@]}"; do
+        if [[ $line = file://* ]]; then
+            line=${line#file://}
+            in_array "$line" "${cache_dirs[@]}" || cache_dirs+=("$line")
+        fi
+    done
+done < <(pacman-conf --config "${pac_conf:-$working_dir/etc/pacman.conf}" --repo-list)
+
+copy_hostconf () {
+    unshare --fork --pid gpg --homedir "$working_dir"/etc/pacman.d/gnupg/ --no-permission-warning --quiet --batch --import --import-options import-local-sigs "$(pacman-conf GpgDir)"/pubring.gpg >/dev/null 2>&1
+    pacman-key --gpgdir "$working_dir"/etc/pacman.d/gnupg/ --import-trustdb "$(pacman-conf GpgDir)" >/dev/null 2>&1
+
+    printf 'Server = %s\n' "${host_mirrors[@]}" >"$working_dir/etc/pacman.d/mirrorlist"
+
+    [[ -n $pacman_conf ]] && cp "$pacman_conf" "${working_dir}/etc/pacman.conf"
+
+    [[ -n $makepkg_conf ]] && cp "$makepkg_conf" "${working_dir}/etc/makepkg.conf"
+
+    local file
+    for file in "${files[@]}"; do
+        mkdir -p "$(dirname "$working_dir$file")"
+        cp -T "$file" "$working_dir$file"
+    done
+
+    sed -r "s|^#?\\s*CacheDir.+|CacheDir = ${cache_dirs[*]}|g" -i "${working_dir}/etc/pacman.conf"
+}
+
+mount_args+=("-B:${cache_dirs[0]//:/\\:}:${cache_dirs[0]//:/\\:}")
+
+for cache_dir in "${cache_dirs[@]:1}"; do
+    mount_args+=("-Br:${cache_dir//:/\\:}:${cache_dir//:/\\:}")
+done
+
+chroot_extra_mount() {
+    chroot_add_resolv_conf "${working_dir}"
+
+    for arg in "${mount_args[@]}"; do
+        local flag=${arg%%:*} dest=${arg##*:} src=${arg%:*}
+        src=${src#*:}
+        chroot_mount "${src}" "${working_dir}${dest}" "${flag}"
+    done
+}
+
+umask 0022
+
+# Sanity check
+if [[ ! -f "$working_dir/.artools" ]]; then
+    die "'%s' does not appear to be an artix chroot." "$working_dir"
+elif [[ $(cat "$working_dir/.artools") != "${CHROOTVERSION}" ]]; then
+    die "chroot '%s' is not at version %s. Please rebuild." "$working_dir" "${CHROOTVERSION}"
+fi
+
+chroot_api_mount "${working_dir}" || die "failed to setup API filesystems in chroot %s" "${working_dir}"
+
+chroot_extra_mount
+
+copy_hostconf
+
+eval "$(grep '^CARCH=' "$working_dir/etc/makepkg.conf")"
+
+[[ -z $nosetarch ]] || unset CARCH
+
+if [[ -f "@datadir@/artools/setarch-aliases.d/${CARCH}" ]]; then
+	read -r set_arch < "@datadir@/artools/setarch-aliases.d/${CARCH}"
+else
+	set_arch="${CARCH}"
+fi
+
+${CARCH:+setarch "${set_arch}"} chroot "${working_dir}" "$@"
+
+ret=$?
+
+kill_chroot_process "${working_dir}"
+
+exit $ret

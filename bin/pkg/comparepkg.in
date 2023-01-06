@@ -1,0 +1,207 @@
+#!/bin/bash
+#
+# Copyright (C) 2018-19 artoo@artixlinux.org
+# Copyright (C) 2018 Artix Linux Developers
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+m4_include(lib/util-base.sh)
+m4_include(lib/util-pkg.sh)
+m4_include(lib/base/message.sh)
+m4_include(lib/pkg/repo.sh)
+m4_include(lib/pkg/table.sh)
+
+
+#{{{ upgrades, downgrades, moves
+
+remove_list(){
+    local name="$1"
+    [[ -f "${TREE_DIR_ARTIX}"/$name.list ]] && rm "${TREE_DIR_ARTIX}"/"$name".list
+}
+
+write_list(){
+    local line="$1" name="$2"
+    printf "%s\n" "$line" >> "${TREE_DIR_ARTIX}"/"$name".list
+}
+
+compare_m(){
+    case ${artixrepo} in
+        *testing*|*staging*|*rebuild)
+            if [[ "${a}" == "${b}" ]]; then
+                msg_row "${table}" "${a}" "${b}" "$pkg" "$archver" "$artixver" "${group#*-}"
+            elif [[ "${a}" == 'staging' && "${b}" == 'rebuild' ]]; then
+                msg_row_yellow "${table}" "${a}" "${b}" "$pkg" "$archver" "$artixver" "${group#*-}"
+            else
+                msg_row_green "${table}" "${a}" "${b}" "$pkg" "$archver" "$artixver" "${group#*-}"
+                if [[ -n "$archrepo" ]]; then
+                    write_list "${a}:${b}:$pkg" pkg_moves
+                else
+                    write_list "@repo@:${b}:$pkg" artix
+                fi
+            fi
+        ;;
+    esac
+}
+
+compare_u(){
+    if [ "$result" -eq -1 ];then
+#         local arel=${archver##*-} brel=${artixver##*-}
+#         local reldiff
+#         reldiff=$(( $arel-${brel%.*} ))
+        msg_row_red "${table}" "${a}" "${b}" "$pkg" "$archver" "$artixver" "${group#*-}"
+        write_list "${a}:$pkg" pkg_upgrades
+    fi
+}
+
+compare_d(){
+    if [ "$result" -eq 1 ];then
+        if [[ -n "$archver" ]] && [[ -n "$archrepo" ]];then
+            msg_row_yellow "${table}" "${a}" "${b}" "$pkg" "$archver" "$artixver" "${group#*-}"
+        fi
+    fi
+}
+
+get_archpath(){
+    local pkg="$1" archpath
+
+    for tree in "${ARCH_TREE[@]}"; do
+        [[ -d ${TREE_DIR_ARCH}/$tree/$pkg/repos ]] && archpath=${TREE_DIR_ARCH}/$tree/$pkg
+    done
+    echo "$archpath"
+}
+
+pre_compare(){
+    local func="$1" pkgpath="$2" result group pkg
+    group="${pkgpath%/*}"
+    group=${group##*/}
+    pkg=${pkgpath##*/}
+
+    local artixrepo archrepo pkgbuild artixver archver archpath node a b
+    artixrepo=$(find_repo "$pkgpath")
+    pkgbuild=$pkgpath/$artixrepo/PKGBUILD
+
+    if [[ -f $pkgbuild ]]; then
+        # shellcheck disable=1090
+        . "$pkgbuild" 2>/dev/null
+        artixver=$(get_full_version)
+        archpath=$(get_archpath "$pkg")
+        archrepo=$(find_repo "${archpath}")
+        pkgbuild=$archpath/$archrepo/PKGBUILD
+        node=${artixrepo%/*}
+        a=${archrepo#*/} b=${artixrepo#*/}
+        a="${a%-*}"
+
+        [[ "$node" != "$CARCH" ]] && b=${b%-*}
+
+        if [[ -f "$pkgbuild" ]]; then
+            # shellcheck disable=1090
+            . "$pkgbuild" 2>/dev/null
+            archver=$(get_full_version)
+        fi
+
+        result=$(vercmp "$artixver" "$archver")
+
+        "$func"
+
+        unset epoch
+    fi
+}
+
+compare_upgrades(){
+    local pkgpath="${1%/*}"
+    pre_compare compare_u "$pkgpath"
+}
+
+compare_downgrades(){
+    local pkgpath="${1%/*}"
+    pre_compare compare_d "$pkgpath"
+}
+
+compare_move(){
+    local pkgpath="${1%/*}"
+    pre_compare compare_m "$pkgpath"
+}
+
+#}}}
+
+show_compare_header(){
+    msg_table_header "${table}" "Arch Repo" "Artix Repo" "Package" "Arch version" "Artix version" "Group"
+}
+
+show_upgrades_table(){
+    show_compare_header
+    remove_list pkg_upgrades
+    tree_loop compare_upgrades
+}
+
+show_downgrades_table(){
+    show_compare_header
+    tree_loop compare_downgrades
+}
+
+show_move_table(){
+    show_compare_header
+    remove_list pkg_moves
+    remove_list artix
+    tree_loop compare_move
+}
+
+load_makepkg_config
+
+load_valid_names
+
+testing=true
+staging=true
+unstable=false
+
+upgrades=false
+downgrades=false
+move=false
+
+readonly table="%-18s %-18s %-25s %-27s %-27s %-10s"
+
+usage() {
+    echo "Usage: ${0##*/} [options]"
+    echo '    -u            Show upgrade packages'
+    echo '    -d            Show downgrade packages'
+    echo '    -m            Show packages to move'
+    echo "    -x            Don't inlcude testing packages"
+    echo "    -y            Don't inlcude staging packages"
+    echo '    -z            Include unstable kde and gnome'
+    echo '    -h            This help'
+    echo ''
+    echo ''
+    exit "$1"
+}
+
+opts='udmxyzh'
+
+while getopts "${opts}" arg; do
+    case "${arg}" in
+        u) upgrades=true ;;
+        d) downgrades=true ;;
+        m) move=true ;;
+        x) testing=false ;;
+        y) staging=false ;;
+        z) unstable=true ;;
+        h|?) usage 0 ;;
+        *) echo "invalid argument '${arg}'"; usage 1 ;;
+    esac
+done
+
+shift $(( OPTIND - 1 ))
+
+set_arch_repos "$testing" "$staging" "$unstable"
+
+${move} && show_move_table
+
+${upgrades} && show_upgrades_table
+
+${downgrades} && show_downgrades_table

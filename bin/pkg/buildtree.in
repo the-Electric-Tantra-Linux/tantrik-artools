@@ -1,0 +1,332 @@
+#!/bin/bash
+#
+# Copyright (C) 2018-19 artoo@artixlinux.org
+# Copyright (C) 2018 Artix Linux Developers
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+m4_include(lib/util-base.sh)
+m4_include(lib/util-pkg.sh)
+m4_include(lib/base/message.sh)
+m4_include(lib/pkg/common.sh)
+m4_include(lib/pkg/git.sh)
+m4_include(lib/pkg/gitea.sh)
+m4_include(lib/pkg/repo.sh)
+m4_include(lib/pkg/jenkins.sh)
+
+#{{{ new git repo
+
+subrepo_clone(){
+    local pkg="$1"
+    local org="$2"
+    local name="$3"
+
+    msg2 "Subrepo clone [%s] from (%s)" "$pkg" "$org/$name"
+    git subrepo clone "${GIT_SSH}":"$org"/"$name".git "$pkg"
+}
+
+subrepo_new(){
+    cd "${TREE_DIR_ARTIX}/${group}" || return
+
+    local org gitname
+    org=$(get_pkg_org "${package}")
+    gitname=$(get_compliant_name "${package}")
+
+    gitearepo -cr "$gitname"
+
+    add_team_to_repo "$gitname" "$org" "${team}"
+
+    subrepo_clone "${package}" "$org" "$gitname"
+
+    mkdir -p "${TREE_DIR_ARTIX}/${group}/${package}/trunk"
+
+    commit_jenkins_files "${package}"
+}
+
+#}}}
+
+#{{{ pull
+
+clone_tree(){
+    local url="$1" tree="$2" os="${3:-Artix}"
+
+    msg "Cloning %s (%s) ..." "$tree" "$os"
+
+    git clone "$url/$tree".git
+}
+
+pull_tree_arch(){
+    cd "${TREE_DIR_ARCH}" || return
+    for tree in "${ARCH_TREE[@]}";do
+        if [[ -d "${tree}" ]];then
+            ( cd "${tree}" || return
+                pull_tree "${tree}" "$(get_local_head)" "Arch"
+            )
+        else
+            clone_tree "${HOST_TREE_ARCH}" "${tree}" "Arch"
+        fi
+    done
+}
+
+config_tree(){
+    local tree="$1"
+    cd "$tree" || return
+        git config --bool pull.rebase true
+        git config commit.gpgsign true
+        if [[ -n "${GPGKEY}" ]];then
+            git config user.signingkey "${GPGKEY}"
+        else
+            warning "No GPGKEY configured in makepkg.conf!"
+        fi
+    cd ..
+}
+
+pull_tree_artix(){
+    local repos=()
+    if ${sync_group}; then
+        repos=("${group}")
+    else
+        repos=("${ARTIX_TREE[@]}")
+    fi
+    cd "${TREE_DIR_ARTIX}" || return
+    for tree in "${repos[@]}"; do
+        if [[ -d "${tree}" ]];then
+            config_tree "${tree}"
+            ( cd "${tree}" || return
+                pull_tree "${tree}" "$(get_local_head)"
+            )
+        else
+            clone_tree "${host_tree_artix}" "${tree}"
+            config_tree "${tree}"
+        fi
+    done
+}
+
+#}}}
+
+#{{{ patch
+
+patch_pkg(){
+    local pkgpath="$1"
+    local pkg=${pkgpath%/*}
+    pkg=${pkg##*/}
+    sed -e 's|arch-meson|artix-meson|' -i "$pkgpath"/PKGBUILD
+    case $pkg in
+        glibc)
+            msg2 "Patching %s" "$pkg"
+            sed -e 's|{locale,systemd/system,tmpfiles.d}|{locale,tmpfiles.d}|' \
+                -e '/nscd.service/d' \
+                -i "$pkgpath"/PKGBUILD
+        ;;
+        linux|linux-lts)
+            msg2 "Patching %s" "$pkg"
+            sed -e 's|KBUILD_BUILD_HOST=.*|KBUILD_BUILD_HOST=artixlinux|' -i "$pkgpath"/PKGBUILD
+            sed -e 's|CONFIG_DEFAULT_HOSTNAME=.*|CONFIG_DEFAULT_HOSTNAME="artixlinux"|' \
+                -i "$pkgpath"/config
+        ;;
+        bash)
+            msg2 "Patching %s" "$pkg"
+            # shellcheck disable=2016
+            sed -e 's|system.bash_logout)|system.bash_logout artix.bashrc)|' \
+            -e "s|etc/bash.|etc/bash/|g" \
+            -e 's|"$pkgdir/etc/skel/.bash_logout"|"$pkgdir/etc/skel/.bash_logout"\n  install -Dm644 artix.bashrc $pkgdir/etc/bash/bashrc.d/artix.bashrc|' \
+            -i "$pkgpath"/PKGBUILD
+            ( cd "$pkgpath" || return
+                patch -Np 1 -i "${DATADIR}"/patches/artix-bash.patch
+                updpkgsums
+            )
+        ;;
+        gstreamer|gst-plugins-*|licenses)
+            msg2 "Patching %s" "$pkg"
+            sed -e 's|https://www.archlinux.org/|https://www.artixlinux.org/|' \
+                -e 's|(Arch Linux)|(Artix Linux)|' \
+                -i "$pkgpath"/PKGBUILD
+        ;;
+    esac
+}
+
+#}}}
+
+#{{{ pkgbuild import
+
+sync_pkg(){
+    local rsync_args=(-aWxvci --progress --delete-before --no-R --no-implied-dirs)
+    local src="$1" dest="$2"
+    msg "Sync from Arch [%s] to Artix [%s]" "${src##*archlinux/}" "${dest##*artixlinux/}"
+    rsync "${rsync_args[@]}" "$src"/ "$dest"/
+}
+
+show_deps(){
+    local src="$1" archver
+
+    # shellcheck disable=1090
+    . "$src"/PKGBUILD 2>/dev/null
+
+    archver=$(get_full_version)
+
+    # shellcheck disable=2154
+    [[ -n ${pkgbase} ]] && msg2 "pkgbase: %s" "${pkgbase}"
+    # shellcheck disable=2154
+    msg2 "pkgname: %s" "${pkgname[*]}"
+    # shellcheck disable=2154
+    [[ -n "${pkgdesc}" ]] && msg2 "pkgdesc: %s" "${pkgdesc}"
+    # shellcheck disable=2154
+    msg2 "Arch Version: %s" "$archver"
+    # shellcheck disable=2154
+    msg2 "arch: %s" "$arch"
+    # shellcheck disable=2154
+    [[ -n ${makedepends[*]} ]] && msg2 "makedepends: %s" "${makedepends[*]}"
+    # shellcheck disable=2154
+    [[ -n ${checkdepends[*]} ]] && msg2 "checkdepends: %s" "${checkdepends[*]}"
+    # shellcheck disable=2154
+    [[ -n ${depends[*]} ]] && msg2 "depends: %s" "${depends[*]}"
+    # shellcheck disable=2154
+    [[ -n ${optdepends[*]} ]] && msg2 "optdepends: %s" "${optdepends[@]}"
+}
+
+from_arch(){
+    cd "${TREE_DIR_ARTIX}" || return
+
+    local srcpath repo archpath artixpath
+    srcpath=$(find_pkg "${TREE_DIR_ARCH}" "${package}")
+    [[ -z $srcpath ]] && die "Package '%s' does not exist!" "${package}"
+
+    repo=$(find_repo "$srcpath")
+    msg "repo: %s" "${repo#*/}"
+
+    archpath=$srcpath/$repo
+    artixpath=$(find_pkg "${TREE_DIR_ARTIX}" "${package}")
+
+    show_deps "$archpath"
+
+    if [[ -f "$artixpath"/.gitrepo ]]; then
+        artixpath="$artixpath"/trunk
+
+        if [[ -d "$artixpath" ]];then
+            sync_pkg "$archpath" "$artixpath"
+            patch_pkg "$artixpath"
+        fi
+    else
+        die "Package '%s' does not exist!" "${package}"
+    fi
+}
+
+#}}}
+
+view_build(){
+    local archpath repo
+    archpath=$(find_pkg "${TREE_DIR_ARCH}" "${package}")
+    [[ -z $archpath ]] && die "Package '%s' does not exist!" "${package}"
+    repo=$(find_repo "${archpath}")
+    archpath=$archpath/$repo
+    msg "repo: %s" "${repo#*/}"
+    show_deps "$archpath"
+}
+
+check_tree(){
+    local archpath artixpath group
+    archpath=$(find_pkg "${TREE_DIR_ARCH}" "${package}")
+    [[ -z $archpath ]] && die "Package '%s' does not exist!" "${package}"
+    artixpath=$(find_pkg "${TREE_DIR_ARTIX}" "${package}")
+    group=${artixpath%/*}
+    msg "group: %s" "${group##*/}"
+
+    [[ -z $artixpath ]] && msg2 "exists: %s" "no"
+    [[ -n $artixpath ]] && msg2 "exists: %s" "yes"
+}
+
+sync_repos(){
+    ${sync_arch} && pull_tree_arch
+    ${sync_artix} && pull_tree_artix
+}
+
+load_makepkg_config
+
+load_valid_names
+
+testing=true
+staging=true
+unstable=false
+
+sync=false
+sync_arch=true
+sync_artix=true
+import=false
+view=false
+createnew=false
+sync_group=false
+check=false
+
+package=''
+
+team='community'
+group="${ARTIX_TREE[0]}"
+
+host_tree_artix="${GIT_SSH}:artixlinux"
+
+usage() {
+    echo "Usage: ${0##*/} [options]"
+    echo '    -p <pkg>      Package name'
+    echo '    -t <team>     Team name (only with -n)'
+    echo '                  Possible values: core,extra,community,multilib'
+    echo "                  [default: ${team}]"
+    echo '    -g <group>    Group name, the superrepo (only with -n or -s)'
+    echo "                  [default: ${group}]"
+    echo "    -s            Clone or pull repos"
+    echo "    -a            Don't clone or pull arch repos"
+    echo "    -b            Don't clone or pull artix repos"
+    echo '    -i            Import a package from arch repos'
+    echo '    -n            New remote subrepo and clone it'
+    echo '    -v            Check if a package is in the artix tree(s)'
+    echo '    -c            View package depends'
+    echo '    -x            Exclude testing (only with -i)'
+    echo '    -y            Exclude staging (only with -i)'
+    echo '    -z            Include kde & gnome unstable (only with -i)'
+    echo '    -h            This help'
+    echo ''
+    echo ''
+    exit "$1"
+}
+
+opts='p:t:g:sinabcvxyzh'
+
+while getopts "${opts}" arg; do
+    case "${arg}" in
+        p) package="$OPTARG" ;;
+        t) team="$OPTARG" ;;
+        g) group="$OPTARG"; sync_group=true ;;
+        s) sync=true ;;
+        a) sync_arch=false ;;
+        b) sync_artix=false ;;
+        i) import=true ;;
+        n) createnew=true ;;
+        c) check=true ;;
+        v) view=true ;;
+        x) testing=false ;;
+        y) staging=false ;;
+        z) unstable=true ;;
+        h|?) usage 0 ;;
+        *) echo "invalid argument '${arg}'"; usage 1 ;;
+    esac
+done
+
+shift $(( OPTIND - 1 ))
+
+set_arch_repos "$testing" "$staging" "$unstable"
+
+${sync} && sync_repos
+
+${view} && view_build
+
+${check} && check_tree
+
+${import} && from_arch
+
+${createnew} && subrepo_new
