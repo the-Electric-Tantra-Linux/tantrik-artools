@@ -1,0 +1,1332 @@
+#!/bin/bash
+#
+# Copyright (C) 2018-19 artoo@artixlinux.org
+# Copyright (C) 2018 Artix Linux Developers
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+#!/hint/bash
+
+#{{{ base conf
+
+DATADIR=${DATADIR:-'/usr/share/artools'}
+SYSCONFDIR=${SYSCONFDIR:-'/etc/artools'}
+
+if [[ -n $SUDO_USER ]]; then
+    eval "USER_HOME=~$SUDO_USER"
+else
+    USER_HOME=$HOME
+fi
+
+USER_CONF_DIR="${XDG_CONFIG_HOME:-$USER_HOME/.config}/artools"
+
+prepare_dir(){
+    [[ ! -d $1 ]] && mkdir -p "$1"
+}
+
+load_base_config(){
+
+    local conf="$1/artools-base.conf"
+
+    [[ -f "$conf" ]] || return 1
+
+    # shellcheck source=/etc/artools/artools-base.conf
+    [[ -r "$conf" ]] && . "$conf"
+
+    CHROOTS_DIR=${CHROOTS_DIR:-'/var/lib/artools'}
+
+    WORKSPACE_DIR=${WORKSPACE_DIR:-"${USER_HOME}/artools-workspace"}
+
+    return 0
+}
+
+#}}}
+
+load_base_config "${USER_CONF_DIR}" || load_base_config "${SYSCONFDIR}"
+
+prepare_dir "${WORKSPACE_DIR}"
+prepare_dir "${USER_CONF_DIR}"
+
+#!/hint/bash
+
+#{{{ iso conf
+
+load_iso_config() {
+
+    local conf="$1/artools-iso.conf"
+
+    [[ -f "$conf" ]] || return 1
+
+    # shellcheck source=/etc/artools/artools-iso.conf
+    [[ -r "$conf" ]] && . "$conf"
+
+    ISO_POOL=${ISO_POOL:-"${WORKSPACE_DIR}/iso"}
+
+    ISO_VERSION=${ISO_VERSION:-"$(date +%Y%m%d)"}
+
+    INITSYS=${INITSYS:-'runit'}
+
+    GPG_KEY=${GPG_KEY:-''}
+
+    COMPRESSION="${COMPRESSION:-zstd}"
+
+    COMPRESSION_LEVEL="${COMPRESSION_LEVEL:-15}"
+
+    if [[ -z "${COMPRESSION_ARGS[*]}" ]]; then
+        COMPRESSION_ARGS=(-Xcompression-level "${COMPRESSION_LEVEL}")
+    fi
+
+    if [[ "${COMPRESSION}" == 'xz' ]]; then
+        COMPRESSION_ARGS=(-Xbcj x86)
+    fi
+
+    return 0
+}
+
+#}}}
+
+load_iso_config "${USER_CONF_DIR}" || load_iso_config "${SYSCONFDIR}"
+
+prepare_dir "${ISO_POOL}"
+
+#!/hint/bash
+
+#{{{ message
+
+#set +u +o posix
+
+# shellcheck disable=1091
+. /usr/share/makepkg/util.sh
+
+export LANG=C
+
+shopt -s extglob
+
+if [[ -t 2 && "$TERM" != dumb ]]; then
+    colorize
+else
+    # shellcheck disable=2034
+    declare -gr ALL_OFF='' BOLD='' BLUE='' GREEN='' RED='' YELLOW=''
+fi
+
+stat_busy() {
+    local mesg=$1; shift
+    # shellcheck disable=2059
+    printf "${GREEN}==>${ALL_OFF}${BOLD} ${mesg}...${ALL_OFF}" "$@" >&2
+}
+
+stat_done() {
+    # shellcheck disable=2059
+    printf "${BOLD}done${ALL_OFF}\n" >&2
+}
+
+lock_close() {
+	local fd=$1
+	exec {fd}>&-
+}
+
+lock() {
+    if ! [[ "/dev/fd/$1" -ef "$2" ]]; then
+        mkdir -p -- "$(dirname -- "$2")"
+        eval "exec $1>"'"$2"'
+    fi
+    if ! flock -n "$1"; then
+        stat_busy "$3"
+        flock "$1"
+        stat_done
+    fi
+}
+
+slock() {
+    if ! [[ "/dev/fd/$1" -ef "$2" ]]; then
+        mkdir -p -- "$(dirname -- "$2")"
+        eval "exec $1>"'"$2"'
+    fi
+    if ! flock -sn "$1"; then
+        stat_busy "$3"
+        flock -s "$1"
+        stat_done
+    fi
+}
+
+_setup_workdir=false
+setup_workdir() {
+    [[ -z ${WORKDIR:-} ]] && WORKDIR=$(mktemp -d --tmpdir "${0##*/}.XXXXXXXXXX")
+    _setup_workdir=true
+    trap 'trap_abort' INT QUIT TERM HUP
+    trap 'trap_exit' EXIT
+}
+
+trap_abort() {
+    trap - EXIT INT QUIT TERM HUP
+    abort
+}
+
+trap_exit() {
+    local r=$?
+    trap - EXIT INT QUIT TERM HUP
+    cleanup $r
+}
+
+cleanup() {
+    if [[ -n ${WORKDIR:-} ]] && $_setup_workdir; then
+        rm -rf "$WORKDIR"
+    fi
+    exit "${1:-0}"
+}
+
+abort() {
+    error 'Aborting...'
+    cleanup 255
+}
+
+die() {
+    (( $# )) && error "$@"
+    cleanup 255
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ common
+
+get_makepkg_conf() {
+    makepkg_conf="${DATADIR}/makepkg.conf"
+    [[ -f ${USER_CONF_DIR}/makepkg.conf ]] && makepkg_conf="${USER_CONF_DIR}/makepkg.conf"
+}
+
+get_pacman_conf() {
+    local repo="$1"
+    pacman_conf="${DATADIR}/pacman-${repo}.conf"
+    [[ -f "${USER_CONF_DIR}/pacman-${repo}.conf" ]] && pacman_conf="${USER_CONF_DIR}/pacman-${repo}.conf"
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ chroot
+
+orig_argv=("$0" "$@")
+check_root() {
+    local keepenv="$1"
+
+    (( EUID == 0 )) && return
+    if type -P sudo >/dev/null; then
+        # shellcheck disable=2154
+        exec sudo --preserve-env="$keepenv" -- "${orig_argv[@]}"
+    else
+        # shellcheck disable=2154
+        exec su root -c "$(printf ' %q' "${orig_argv[@]}")"
+    fi
+}
+
+is_btrfs() {
+    [[ -e "$1" && "$(stat -f -c %T "$1")" == btrfs ]]
+}
+
+is_subvolume() {
+    [[ -e "$1" && "$(stat -f -c %T "$1")" == btrfs && "$(stat -c %i "$1")" == 256 ]]
+}
+
+# is_same_fs() {
+#     [[ "$(stat -c %d "$1")" == "$(stat -c %d "$2")" ]]
+# }
+
+subvolume_delete_recursive() {
+    local subvol
+
+    is_subvolume "$1" || return 0
+
+    while IFS= read -d $'\0' -r subvol; do
+        if ! subvolume_delete_recursive "$subvol"; then
+            return 1
+        fi
+    done < <(find "$1" -mindepth 1 -xdev -depth -inum 256 -print0)
+    if ! btrfs subvolume delete "$1" &>/dev/null; then
+        error "Unable to delete subvolume %s" "$subvol"
+        return 1
+    fi
+
+    return 0
+}
+
+# }}}
+
+#!/hint/bash
+
+#{{{ mount
+
+track_img() {
+    msg2 "mount: [%s]" "$2"
+    mount "$@" && IMG_ACTIVE_MOUNTS=("$2" "${IMG_ACTIVE_MOUNTS[@]}")
+}
+
+mount_img() {
+    IMG_ACTIVE_MOUNTS=()
+    mkdir -p "$2"
+    track_img "$1" "$2"
+}
+
+umount_img() {
+    if [[ -n "${IMG_ACTIVE_MOUNTS[*]}" ]];then
+        msg2 "umount: [%s]" "${IMG_ACTIVE_MOUNTS[@]}"
+        umount "${IMG_ACTIVE_MOUNTS[@]}"
+        unset IMG_ACTIVE_MOUNTS
+        rm -r "$1"
+    fi
+}
+
+track_fs() {
+    msg2 "overlayfs mount: [%s]" "$5"
+    mount "$@" && FS_ACTIVE_MOUNTS=("$5" "${FS_ACTIVE_MOUNTS[@]}")
+}
+
+mount_overlayfs(){
+    FS_ACTIVE_MOUNTS=()
+    local lower upper="$1" work="$2"
+    mkdir -p "${mnt_dir}/work"
+    mkdir -p "$upper"
+    case $upper in
+        */livefs) lower="$work/rootfs" ;;
+        */bootfs)
+            lower="$work/rootfs"
+            [[ -d "$work/livefs" ]] && lower="$work/livefs:$work/rootfs"
+        ;;
+    esac
+    # shellcheck disable=2140
+    track_fs -t overlay overlay -olowerdir="$lower",upperdir="$upper",workdir="${mnt_dir}/work" "$upper"
+}
+
+umount_overlayfs(){
+    if [[ -n "${FS_ACTIVE_MOUNTS[*]}" ]];then
+        msg2 "overlayfs umount: [%s]" "${FS_ACTIVE_MOUNTS[@]}"
+        umount "${FS_ACTIVE_MOUNTS[@]}"
+        unset FS_ACTIVE_MOUNTS
+        rm -rf "${mnt_dir}/work"
+    fi
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ services
+
+add_svc_openrc(){
+    local mnt="$1" names="$2" rlvl="${3:-default}"
+    for svc in $names; do
+        if [[ -f $mnt/etc/init.d/$svc ]];then
+            msg2 "Setting %s: [%s]" "${INITSYS}" "$svc"
+            chroot "$mnt" rc-update add "$svc" "$rlvl" &>/dev/null
+        fi
+    done
+}
+
+add_svc_runit(){
+    local mnt="$1" names="$2" rlvl="${3:-default}"
+    for svc in $names; do
+        if [[ -d $mnt/etc/runit/sv/$svc ]]; then
+            msg2 "Setting %s: [%s]" "${INITSYS}" "$svc"
+            chroot "$mnt" ln -s /etc/runit/sv/"$svc" /etc/runit/runsvdir/"$rlvl" &>/dev/null
+        fi
+    done
+}
+
+add_svc_s6(){
+    local mnt="$1" names="$2" rlvl="${3:-default}" dep
+    dep="$mnt"/etc/s6/sv/"$display_manager"-srv/dependencies.d
+    for svc in $names; do
+        msg2 "Setting %s: [%s]" "${INITSYS}" "$svc"
+        chroot "$mnt" s6-service add "$rlvl" "$svc"
+        if [[ "$svc" == "$display_manager" ]]; then
+            if [[ -d "$dep" ]]; then
+                touch "$dep"/artix-live
+            fi
+        fi
+    done
+
+    chroot "$mnt" s6-db-reload -r
+
+    local src=/etc/s6/current skel=/etc/s6/skel getty='/usr/bin/agetty -L -8 tty7 115200'
+    # rebuild s6-linux-init binaries
+    chroot "$mnt" rm -r "$src"
+    chroot "$mnt" s6-linux-init-maker -1 -N -f "$skel" -G "$getty" -c "$src" "$src"
+    chroot "$mnt" mv "$src"/bin/init "$src"/bin/s6-init
+    chroot "$mnt" cp -a "$src"/bin /usr
+}
+
+add_svc_suite66(){
+    local mnt="$1" names="$2"
+    for svc in $names; do
+        if [[ -f "$mnt"/etc/66/service/"$svc" ]]; then
+            msg2 "Setting %s: [%s]" "${INITSYS}" "$svc"
+            chroot "$mnt" 66-enable -t default "$svc" &>/dev/null
+        fi
+    done
+}
+
+add_svc_dinit(){
+    local mnt="$1" names="$2"
+    for svc in $names; do
+        if [[ -d $mnt/etc/dinit.d/boot.d ]]; then
+            msg2 "Setting %s: [%s]" "${INITSYS}" "$svc"
+            chroot "$mnt" ln -s ../"$svc" /etc/dinit.d/boot.d/"$svc" &>/dev/null
+        fi
+    done
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ yaml
+
+write_yaml_header(){
+    printf '%s' '---'
+}
+
+write_empty_line(){
+    printf '\n%s\n' ' '
+}
+
+write_yaml_map(){
+    local ident="$1" key="$2" val="$3"
+    printf "\n%${ident}s%s: %s\n" '' "$key" "$val"
+}
+
+write_yaml_seq(){
+    local ident="$1" val="$2"
+    printf "\n%${ident}s- %s\n" '' "$val"
+}
+
+write_yaml_seq_map(){
+    local ident="$1" key="$2" val="$3"
+    printf "\n%${ident}s- %s: %s\n" '' "$key" "$val"
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ calamares
+
+write_services_conf(){
+    local key1="$1" val1="$2" key2="$3" val2="$4"
+    local yaml
+    yaml=$(write_yaml_header)
+    yaml+=$(write_yaml_map 0 "$key1" "$val1")
+    yaml+=$(write_yaml_map 0 "$key2" "$val2")
+    yaml+=$(write_yaml_map 0 'services')
+    for svc in "${SERVICES[@]}"; do
+        yaml+=$(write_yaml_seq 2 "$svc")
+    done
+    yaml+=$(write_empty_line)
+    printf '%s' "${yaml}"
+}
+
+write_services_openrc_conf(){
+    local conf="$1"/services-openrc.conf
+    write_services_conf 'initdDir' '/etc/init.d' 'runlevelsDir' '/etc/runlevels' > "$conf"
+}
+
+write_services_runit_conf(){
+    local conf="$1"/services-runit.conf
+    write_services_conf 'svDir' '/etc/runit/sv' 'runsvDir' '/etc/runit/runsvdir' > "$conf"
+}
+
+write_services_s6_conf(){
+    local conf="$1"/services-s6.conf
+    write_services_conf 'svDir' '/etc/s6/sv' 'dbDir' '/etc/s6/rc/compiled' > "$conf"
+    printf '%s\n' "" >> "$conf"
+    printf '%s\n' "defaultBundle: default" >> "$conf"
+}
+
+write_services_suite66_conf(){
+    local conf="$1"/services-suite66.conf
+    write_services_conf 'svDir' '/etc/66/service' 'runsvDir' '/var/lib/66/system' > "$conf"
+}
+
+write_services_dinit_conf(){
+    local conf="$1"/services-dinit.conf
+    write_services_conf 'initdDir' '/etc/dinit.d' 'runsvDir' '/etc/dinit.d/boot.d' > "$conf"
+}
+
+configure_calamares(){
+    local mods="$1/etc/calamares/modules"
+    if [[ -d "$mods" ]];then
+        msg2 "Configuring: Calamares"
+        write_services_"${INITSYS}"_conf "$mods"
+        sed -e "s|services-openrc|services-${INITSYS}|" \
+            -i "$1"/etc/calamares/settings.conf
+    fi
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ session
+
+configure_services(){
+    local mnt="$1"
+    add_svc_"${INITSYS}" "$mnt" "${SERVICES[*]}"
+}
+
+
+write_live_session_conf(){
+    local conf=''
+    conf+=$(printf '%s\n' '# live session configuration')
+    conf+=$(printf "\nAUTOLOGIN=%s\n" "${AUTOLOGIN}")
+    conf+=$(printf "\nPASSWORD=%s\n" "${PASSWORD}")
+    printf '%s' "$conf"
+}
+
+configure_chroot(){
+    local fs="$1"
+    msg "Configuring [%s]" "${fs##*/}"
+    configure_services "$fs"
+    configure_calamares "$fs"
+    [[ ! -d "$fs/etc/artools" ]] && mkdir -p "$fs/etc/artools"
+    msg2 "Writing: live.conf"
+    write_live_session_conf > "$fs/etc/artools/live.conf"
+    msg "Done configuring [%s]" "${fs##*/}"
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ firmware
+
+prepare_boot_extras(){
+    local src="$1" dest
+    dest=${iso_root}/boot
+
+    for fw in intel amd; do
+        cp "$src"/boot/"$fw"-ucode.img "$dest/$fw"-ucode.img
+    done
+
+    cp "$src"/boot/memtest86+/memtest.bin "$dest"/memtest
+    cp "$src"/usr/share/licenses/common/GPL2/license.txt "$dest"/memtest.COPYING
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ dracut
+
+prepare_initramfs_dracut(){
+    local mnt="$1"
+    local kver
+    kver=$(<"$mnt"/usr/src/linux/version)
+
+    printf "%s\n" 'add_dracutmodules+=" dmsquash-live"' > "$mnt"/etc/dracut.conf.d/50-live.conf
+
+    msg "Starting build: %s" "${kver}"
+    artix-chroot "$mnt" dracut -fqM /boot/initramfs.img "$kver"
+    msg "Image generation successful"
+
+    cp "$mnt"/boot/initramfs.img "${iso_root}"/boot/initramfs-"${arch}".img
+
+    prepare_boot_extras "$mnt"
+}
+
+configure_grub_dracut(){
+    msg "Configuring grub kernel options ..."
+    local kopts=()
+    kopts=(
+        "root=live:LABEL=${iso_label}"
+        'rd.live.squashimg=rootfs.img'
+        'rd.live.image'
+        'rootflags=auto'
+    )
+    [[ "${profile}" != 'base' ]] && kopts+=("rd.live.join=livefs.img")
+
+    local ro_opts=()
+    local rw_opts=()
+#         'rd.writable.fsimg=1'
+
+    sed -e "s|@kopts@|${kopts[*]}|" \
+        -e "s|@ro_opts@|${ro_opts[*]}|" \
+        -e "s|@rw_opts@|${rw_opts[*]}|" \
+        -i "${iso_root}"/boot/grub/kernels.cfg
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ initcpio
+
+make_checksum(){
+    local file="$1"
+    msg2 "Creating md5sum ..."
+    cd "${iso_root}${live_dir}"
+    md5sum "$file" > "$file".md5
+    cd "${OLDPWD}"
+}
+
+make_sig () {
+    local file="$1"
+    msg2 "Creating signature file..."
+    chown "${owner}:$(id --group "${owner}")" "${iso_root}${live_dir}"
+    su "${owner}" -c "gpg --detach-sign --output $file.sig --default-key ${GPG_KEY} $file"
+    chown "root:root" "${iso_root}${live_dir}"
+}
+
+export_gpg_publickey() {
+    key_export=${WORKSPACE_DIR}/pubkey.gpg
+    if [[ ! -e "${key_export}" ]]; then
+        gpg --batch --output "${key_export}" --export "${GPG_KEY}"
+    fi
+}
+
+prepare_initramfs_mkinitcpio() {
+    local mnt="$1" packages=() mkinitcpio_conf k
+
+    mkinitcpio_conf=mkinitcpio-default.conf
+    [[ "${profile}" == 'base' ]] && mkinitcpio_conf=mkinitcpio-pxe.conf
+    k=$(<"$mnt"/usr/src/linux/version)
+
+    read_from_list "${common_dir}/Packages-boot"
+    basestrap "${basestrap_args[@]}" "$mnt" "${packages[@]}"
+
+    if [[ -n "${GPG_KEY}" ]]; then
+        exec {ARTIX_GNUPG_FD}<>"${key_export}"
+        export ARTIX_GNUPG_FD
+    fi
+
+    artix-chroot "$mnt" mkinitcpio -k "$k" \
+        -c /etc/"$mkinitcpio_conf" \
+        -g /boot/initramfs.img
+
+    if [[ -n "${GPG_KEY}" ]]; then
+        exec {ARTIX_GNUPG_FD}<&-
+        unset ARTIX_GNUPG_FD
+    fi
+    if [[ -f "${key_export}" ]]; then
+        rm "${key_export}"
+    fi
+    cp "$mnt"/boot/initramfs.img "${iso_root}"/boot/initramfs-"${arch}".img
+    prepare_boot_extras "$mnt"
+}
+
+configure_grub_mkinitcpio() {
+    msg "Configuring grub kernel options ..."
+    local ro_opts=()
+    local rw_opts=()
+    local kopts=("label=${iso_label}")
+
+    [[ "${profile}" != 'base' ]] && kopts+=('overlay=livefs')
+
+    sed -e "s|@kopts@|${kopts[*]}|" \
+        -e "s|@ro_opts@|${ro_opts[*]}|" \
+        -e "s|@rw_opts@|${rw_opts[*]}|" \
+        -i "${iso_root}"/boot/grub/kernels.cfg
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ grub
+
+prepare_grub(){
+    local platform=i386-pc img='core.img' prefix=/boot/grub
+    local lib="$1"/usr/lib/grub
+    local theme="$1"/usr/share/grub
+    local livecfg="$2"/usr/share/grub
+    local grub=${iso_root}/boot/grub efi=${iso_root}/efi/boot
+
+    prepare_dir "${grub}/${platform}"
+
+    cp "${livecfg}"/cfg/*.cfg "${grub}"
+
+    cp "${lib}/${platform}"/* "${grub}/${platform}"
+
+    msg2 "Building %s ..." "${img}"
+
+    grub-mkimage -d "${grub}/${platform}" -o "${grub}/${platform}/${img}" -O "${platform}" -p "${prefix}" biosdisk iso9660
+
+    cat "${grub}/${platform}"/cdboot.img "${grub}/${platform}/${img}" > "${grub}/${platform}"/eltorito.img
+
+    platform=x86_64-efi
+    img=bootx64.efi
+
+    prepare_dir "${efi}"
+    prepare_dir "${grub}/${platform}"
+
+    cp "${lib}/${platform}"/* "${grub}/${platform}"
+
+    msg2 "Building %s ..." "${img}"
+
+    grub-mkimage -d "${grub}/${platform}" -o "${efi}/${img}" -O "${platform}" -p "${prefix}" iso9660
+
+    prepare_dir "${grub}"/themes
+
+    cp -r "${theme}"/themes/Bhairava"${grub}"/themes
+    cp -r "${livecfg}"/{locales,tz} "${grub}"
+
+    if [[ -f /usr/share/grub/unicode.pf2 ]];then
+        msg2 "Copying %s ..." "unicode.pf2"
+        cp /usr/share/grub/unicode.pf2 "${grub}"/unicode.pf2
+    else
+        msg2 "Creating %s ..." "unicode.pf2"
+        grub-mkfont -o "${grub}"/unicode.pf2 /usr/share/fonts/misc/unifont.bdf
+    fi
+
+    local size=4M mnt="${mnt_dir}/efiboot" efi_img="${iso_root}/boot/efi.img"
+    msg2 "Creating fat image of %s ..." "${size}"
+    truncate -s "${size}" "${efi_img}"
+    mkfs.fat -n ARTIX_EFI "${efi_img}" &>/dev/null
+    prepare_dir "${mnt}"
+    mount_img "${efi_img}" "${mnt}"
+    prepare_dir "${mnt}"/efi/boot
+    msg2 "Building %s ..." "${img}"
+    grub-mkimage -d "${grub}/${platform}" -o "${mnt}"/efi/boot/"${img}" -O "${platform}" -p "${prefix}" iso9660
+    umount_img "${mnt}"
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ squash
+
+make_ext_img(){
+    local src="$1"
+    local size=32G
+    local mnt="${mnt_dir}/${src##*/}"
+    mkdir -p "${work_dir}"/embed"${live_dir}"
+    local extimg="${work_dir}/embed${live_dir}/${src##*/}".img
+
+    msg2 "Creating ext4 image of %s ..." "${size}"
+    truncate -s ${size} "${extimg}"
+    local ext4_args=()
+    ext4_args+=("-O ^has_journal,^resize_inode" -E lazy_itable_init=0 -m 0)
+    mkfs.ext4 "${ext4_args[@]}" -F "${extimg}" &>/dev/null
+    tune2fs -c 0 -i 0 "${extimg}" &> /dev/null
+    mount_img "${extimg}" "${mnt}"
+    msg2 "Copying %s ..." "${src}/"
+    cp -aT "${src}/" "${mnt}/"
+    umount_img "${mnt}"
+}
+
+has_changed(){
+    local src="$1" dest="$2"
+    if [[ -f "${dest}" ]]; then
+        local has_changes
+        has_changes=$(find "${src}" -newer "${dest}")
+        if [[ -n "${has_changes}" ]]; then
+            msg2 "Possible changes for %s ..." "${src}"
+            msg2 "%s" "${has_changes}"
+            msg2 "SquashFS image %s is not up to date, rebuilding..." "${dest}"
+            rm "${dest}"
+        else
+            msg2 "SquashFS image %s is up to date, skipping." "${dest}"
+            return 1
+        fi
+    fi
+}
+
+# $1: image path
+make_sfs() {
+    local sfs_in="$1"
+    if [[ ! -e "${sfs_in}" ]]; then
+        error "The path %s does not exist" "${sfs_in}"
+        retrun 1
+    fi
+
+    mkdir -p "${iso_root}${live_dir}"
+
+    local img_name=${sfs_in##*/}.img
+
+    local sfs_out="${iso_root}${live_dir}/${img_name}"
+
+    if has_changed "${sfs_in}" "${sfs_out}"; then
+
+        msg "Generating SquashFS image for %s" "${sfs_in}"
+
+        local mksfs_args=()
+
+        if ${persist};then
+            make_ext_img "${sfs_in}"
+            mksfs_args+=("${work_dir}/embed")
+        else
+            mksfs_args+=("${sfs_in}")
+        fi
+
+        mksfs_args+=("${sfs_out}")
+
+        mksfs_args+=(-comp "${COMPRESSION}" "${COMPRESSION_ARGS[@]}" -noappend)
+
+        mksquashfs "${mksfs_args[@]}"
+
+        if ! ${use_dracut}; then
+            make_checksum "${img_name}"
+            if [[ -n ${GPG_KEY} ]];then
+                make_sig "${iso_root}${live_dir}/${img_name}"
+            fi
+        fi
+        if ${persist}; then
+            rm -r "${work_dir}/embed"
+        fi
+    fi
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ iso
+
+get_disturl(){
+    # shellcheck disable=1091
+    . /usr/lib/os-release
+    echo "${HOME_URL}"
+}
+
+get_osname(){
+    # shellcheck disable=1091
+    . /usr/lib/os-release
+    echo "${NAME}"
+}
+
+assemble_iso(){
+    msg "Creating ISO image..."
+    local mod_date
+    mod_date=$(date -u +%Y-%m-%d-%H-%M-%S-00  | sed -e s/-//g)
+    local appid
+    appid="$(get_osname) Live/Rescue CD"
+    local publisher
+    publisher="$(get_osname) <$(get_disturl)>"
+
+    xorriso -as mkisofs \
+        --modification-date="${mod_date}" \
+        --protective-msdos-label \
+        -volid "${iso_label}" \
+        -appid "${appid}" \
+        -publisher "${publisher}" \
+        -preparer "Prepared by artools/${0##*/}" \
+        -r -graft-points -no-pad \
+        --sort-weight 0 / \
+        --sort-weight 1 /boot \
+        --grub2-mbr "${iso_root}"/boot/grub/i386-pc/boot_hybrid.img \
+        -partition_offset 16 \
+        -b boot/grub/i386-pc/eltorito.img \
+        -c boot.catalog \
+        -no-emul-boot -boot-load-size 4 -boot-info-table --grub2-boot-info \
+        -eltorito-alt-boot \
+        -append_partition 2 0xef "${iso_root}"/boot/efi.img \
+        -e --interval:appended_partition_2:all:: -iso_mbr_part_type 0x00 \
+        -no-emul-boot \
+        -iso-level 3 \
+        -o "${iso_dir}/${iso_file}" \
+        "${iso_root}"/
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ profile
+
+show_profile(){
+    msg2 "iso_file: %s" "${iso_file}"
+    msg2 "AUTOLOGIN: %s" "${AUTOLOGIN}"
+    msg2 "PASSWORD: %s" "${PASSWORD}"
+    msg2 "SERVICES: %s" "${SERVICES[*]}"
+}
+
+load_profile(){
+    local profile_dir="${DATADIR}/iso-profiles"
+    [[ -d "${WORKSPACE_DIR}"/iso-profiles ]] && profile_dir="${WORKSPACE_DIR}"/iso-profiles
+
+    root_list="$profile_dir/${profile}/Packages-Root"
+    root_overlay="$profile_dir/${profile}/root-overlay"
+
+    [[ -f "$profile_dir/${profile}/Packages-Live" ]] && live_list="$profile_dir/${profile}/Packages-Live"
+    [[ -d "$profile_dir/${profile}/live-overlay" ]] && live_overlay="$profile_dir/${profile}/live-overlay"
+
+    common_dir="${DATADIR}/iso-profiles/common"
+    [[ -d "$profile_dir"/common ]] && common_dir="${profile_dir}"/common
+
+    [[ -f $profile_dir/${profile}/profile.conf ]] || return 1
+
+    # shellcheck disable=1090
+    [[ -r "$profile_dir/${profile}"/profile.conf ]] && . "$profile_dir/${profile}"/profile.conf
+
+    AUTOLOGIN=${AUTOLOGIN:-true}
+
+    PASSWORD=${PASSWORD:-'artix'}
+
+    if [[ -z "${SERVICES[*]}" ]];then
+        SERVICES=('acpid' 'bluetoothd' 'cronie' 'cupsd' 'syslog-ng' 'connmand')
+    fi
+
+    return 0
+}
+
+read_from_list() {
+    local list="$1"
+    local _space="s| ||g"
+    local _clean=':a;N;$!ba;s/\n/ /g'
+    local _com_rm="s|#.*||g"
+
+    local _init="s|@initsys@|${INITSYS}|g"
+
+    msg2 "Loading Packages: [%s] ..." "${list##*/}"
+    packages+=($(sed "$_com_rm" "$list" \
+            | sed "$_space" \
+            | sed "$_init" \
+            | sed "$_clean"))
+}
+
+read_from_services() {
+    for svc in "${SERVICES[@]}"; do
+        case "$svc" in
+            sddm|gdm|lightdm|mdm|greetd|lxdm|xdm)
+                packages+=("$svc-${INITSYS}"); display_manager="$svc" ;;
+            NetworkManager) packages+=("networkmanager-${INITSYS}") ;;
+            connmand) packages+=("connman-${INITSYS}") ;;
+            cupsd) packages+=("cups-${INITSYS}") ;;
+            bluetoothd) packages+=("bluez-${INITSYS}") ;;
+            syslog-ng|metalog) packages+=("$svc-${INITSYS}") ;;
+        esac
+    done
+}
+
+load_pkgs(){
+    local pkglist="$1"
+    packages=()
+
+    if [[ "${pkglist##*/}" == "Packages-Root" ]]; then
+        read_from_list "${common_dir}/Packages-base"
+        read_from_list "${common_dir}/Packages-apps"
+        read_from_list "${common_dir}/Packages-${INITSYS}"
+        [[ -n "${live_list}" ]] && read_from_list "${common_dir}/Packages-xorg"
+        read_from_list "$pkglist"
+        read_from_services
+    else
+        read_from_list "$pkglist"
+    fi
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ trap
+
+error_function() {
+    local func="$1"
+    # first exit all subshells, then print the error
+    if (( ! BASH_SUBSHELL )); then
+        error "A failure occurred in %s()." "$func"
+        plain "Aborting..."
+    fi
+    umount_overlayfs
+    umount_img
+    exit 2
+}
+
+run_safe() {
+    local restoretrap func="$1"
+    set -e
+    set -E
+    restoretrap=$(trap -p ERR)
+    trap 'error_function $func' ERR
+
+    "$func"
+
+    eval "$restoretrap"
+    set +E
+    set +e
+}
+
+trap_exit() {
+    local sig=$1; shift
+    error "$@"
+    umount_overlayfs
+    trap -- "$sig"
+    kill "-$sig" "$$"
+}
+
+prepare_traps(){
+    for sig in TERM HUP QUIT; do
+        # shellcheck disable=2064
+        trap "trap_exit $sig \"$(gettext "%s signal caught. Exiting...")\" \"$sig\"" "$sig"
+    done
+    trap 'trap_exit INT "$(gettext "Aborted by user! Exiting...")"' INT
+#     trap 'trap_exit USR1 "$(gettext "An unknown error has occurred. Exiting...")"' ERR
+}
+
+#}}}
+
+
+clean_up_chroot(){
+    local path mnt="$1"
+    msg2 "Cleaning [%s]" "${mnt##*/}"
+
+    path=$mnt/boot
+    if [[ -d "$path" ]]; then
+        find "$path" -name 'initramfs*.img' -delete &> /dev/null
+    fi
+    path=$mnt/var/lib/pacman/sync
+    if [[ -d $path ]];then
+        find "$path" -type f -delete &> /dev/null
+    fi
+    path=$mnt/var/cache/pacman/pkg
+    if [[ -d $path ]]; then
+        find "$path" -type f -delete &> /dev/null
+    fi
+    path=$mnt/var/log
+    if [[ -d $path ]]; then
+        find "$path" -type f -delete &> /dev/null
+    fi
+    path=$mnt/var/tmp
+    if [[ -d $path ]];then
+        find "$path" -mindepth 1 -delete &> /dev/null
+    fi
+    path=$mnt/tmp
+    if [[ -d $path ]];then
+        find "$path" -mindepth 1 -delete &> /dev/null
+    fi
+    # shellcheck disable=2035
+    find "$mnt" -name *.pacnew -name *.pacsave -name *.pacorig -delete
+    if [[ -f "$mnt/boot/grub/grub.cfg" ]]; then
+        rm "$mnt"/boot/grub/grub.cfg
+    fi
+    if [[ -f "$mnt/etc/machine-id" ]]; then
+        rm "$mnt"/etc/machine-id
+    fi
+}
+
+copy_overlay(){
+    local src="$1" dest="$2"
+    if [[ -e "$src" ]];then
+        msg2 "Copying [%s] ..." "${src##*/}"
+        cp -LR "$src"/* "$dest"
+    fi
+}
+
+make_rootfs() {
+    if [[ ! -e "${work_dir}"/rootfs.lock ]]; then
+        msg "Prepare [Base installation] (rootfs)"
+        local rootfs="${work_dir}/rootfs"
+
+        prepare_dir "${rootfs}"
+
+        basestrap "${basestrap_args[@]}" "${rootfs}" "${packages[@]}"
+
+        copy_overlay "${root_overlay}" "${rootfs}"
+
+        [[ -z ${live_list} ]] && configure_chroot "${rootfs}"
+
+        clean_up_chroot "${rootfs}"
+
+        : > "${work_dir}"/rootfs.lock
+
+        msg "Done [Base installation] (rootfs)"
+    fi
+}
+
+make_livefs() {
+    if [[ ! -e ${work_dir}/livefs.lock ]]; then
+        msg "Prepare [Live installation] (livefs)"
+        local livefs="${work_dir}/livefs"
+
+        prepare_dir "${livefs}"
+
+        mount_overlayfs "${livefs}" "${work_dir}"
+
+        basestrap "${basestrap_args[@]}" "${livefs}" "${packages[@]}"
+
+        copy_overlay "${live_overlay}" "${livefs}"
+
+        configure_chroot "${livefs}"
+
+        umount_overlayfs
+
+        clean_up_chroot "${livefs}"
+
+        : > "${work_dir}"/livefs.lock
+
+        msg "Done [Live installation] (livefs)"
+    fi
+}
+
+make_bootfs() {
+    if [[ ! -e ${work_dir}/bootfs.lock ]]; then
+        msg "Prepare [/iso/boot]"
+
+        prepare_dir "${iso_root}/boot"
+
+        cp "${work_dir}"/rootfs/boot/vmlinuz* "${iso_root}"/boot/vmlinuz-"${arch}"
+
+        local bootfs="${work_dir}/bootfs"
+
+        mount_overlayfs "${bootfs}" "${work_dir}"
+
+        if "${use_dracut}"; then
+            prepare_initramfs_dracut "${bootfs}"
+        else
+            prepare_initramfs_mkinitcpio "${bootfs}"
+        fi
+
+        umount_overlayfs
+
+        rm -R "${bootfs}"
+        : > "${work_dir}"/bootfs.lock
+        msg "Done [/iso/boot]"
+    fi
+}
+
+make_grub(){
+    if [[ ! -e ${work_dir}/grub.lock ]]; then
+        msg "Prepare [/iso/boot/grub]"
+
+        local layer=${work_dir}/rootfs
+        [[ -n ${live_list} ]] && layer=${work_dir}/livefs
+
+        prepare_grub "${work_dir}/rootfs" "$layer"
+
+        if ${use_dracut}; then
+            configure_grub_dracut
+        else
+            configure_grub_mkinitcpio
+        fi
+
+        : > "${work_dir}"/grub.lock
+        msg "Done [/iso/boot/grub]"
+    fi
+}
+
+gen_iso_fn(){
+    local vars=("artix") name
+    vars+=("${profile}")
+    vars+=("${INITSYS}")
+    case "${repo}" in
+        'gremlins'|'goblins') vars+=("${repo}") ;;
+    esac
+    vars+=("${ISO_VERSION}")
+    vars+=("${arch}")
+    for n in "${vars[@]}"; do
+        name=${name:-}${name:+-}${n}
+    done
+    echo "$name"
+}
+
+prepare_build(){
+    load_profile
+
+    case "${repo}" in
+        'gremlins'|'goblins') repo="${repo}" ;;
+        *) repo=default ;;
+    esac
+
+    get_pacman_conf "${repo}"
+
+    iso_file=$(gen_iso_fn).iso
+
+    iso_label="ARTIX_$(date +%Y%m)"
+
+    basestrap_args+=(-C "${pacman_conf}")
+    work_dir=${chroots_iso}/${profile}/artix
+
+    iso_dir="${ISO_POOL}/${profile}"
+
+    iso_root=${chroots_iso}/${profile}/iso
+    live_dir=/LiveOS
+
+    mnt_dir=${chroots_iso}/${profile}/mnt
+
+    if [[ -n "${GPG_KEY}" ]]; then
+        ${use_dracut} || export_gpg_publickey
+    fi
+}
+
+display_settings(){
+    msg "OPTIONS:"
+    msg2 "profile: %s" "${profile}"
+    msg2 "INITSYS: %s" "${INITSYS}"
+    [[ -n ${GPG_KEY} ]] && msg2 "GPG_KEY: %s" "${GPG_KEY}"
+
+    msg "ISO SETTINGS:"
+    msg2 "ISO_VERSION: %s" "${ISO_VERSION}"
+    msg2 "COMPRESSION: %s" "${COMPRESSION}"
+    [[ "${COMPRESSION}" == 'zstd' ]] && msg2 "COMPRESSION_LEVEL: %s" "${COMPRESSION_LEVEL}"
+
+    msg "BUILD:"
+    show_profile
+}
+
+mk_squash(){
+    make_sfs "${work_dir}/rootfs"
+    if [[ -d "${work_dir}/livefs" ]]; then
+        make_sfs "${work_dir}/livefs"
+    fi
+}
+
+mk_iso(){
+    touch "${iso_root}/.artix"
+    msg "Making bootable image"
+    # Sanity checks
+    [[ ! -d "${iso_root}" ]] && return 1
+    if [[ -f "${iso_dir}/${iso_file}" ]]; then
+        msg2 "Removing existing bootable image..."
+        rm -rf "${iso_dir}/${iso_file}"
+    fi
+    assemble_iso
+    chown -R "${owner}:$(id --group "${owner}")" "${iso_dir}"
+}
+
+mk_boot(){
+    run_safe "make_bootfs"
+    run_safe "make_grub"
+}
+
+mk_chroots(){
+    load_pkgs "${root_list}"
+    run_safe "make_rootfs"
+    if [[ -n ${live_list} ]]; then
+        load_pkgs "${live_list}"
+        run_safe "make_livefs"
+    fi
+}
+
+build(){
+    msg "Start building [%s]" "${profile}"
+    if ${clean_first};then
+        for copy in "${work_dir}"/*; do
+            [[ -d $copy ]] || continue
+            msg2 "Deleting chroot copy '%s'..." "$(basename "${copy}")"
+
+            lock 9 "$copy.lock" "Locking chroot copy '%s'" "$copy"
+
+            subvolume_delete_recursive "${copy}"
+            rm -rf --one-file-system "${copy}"
+        done
+        lock_close 9
+
+        rm -rf --one-file-system "${work_dir}"
+
+        msg "Deleting isoroot [%s] ..." "${iso_root##*/}"
+        rm -rf --one-file-system "${iso_root}"
+    fi
+
+    if ${chroot_only}; then
+        mk_chroots
+        warning "Continue squash: %s -p %s -sc ..." "${cmd}" "${profile}"
+        exit 1
+    elif ${boot_only}; then
+        mk_boot
+        warning "Continue iso: %s -p %s -zc ..." "${cmd}" "${profile}"
+        exit 1
+    elif ${squash_only}; then
+        mk_squash
+        warning "Continue boot: %s -p %s -bc ..." "${cmd}" "${profile}"
+        exit 1
+    elif ${iso_only}; then
+        [[ ! -d ${work_dir} ]] && die "Create chroot: %s -p %s -x" "${cmd}" "${profile}"
+        mk_iso
+    else
+        mk_chroots
+        mk_boot
+        mk_squash
+        mk_iso
+    fi
+    msg "Finished building [%s]" "${profile}"
+}
+
+clean_first=true
+pretend=false
+chroot_only=false
+iso_only=false
+persist=false
+use_dracut=false
+squash_only=false
+boot_only=false
+
+basestrap_args=(-GMc)
+cmd=${0##*/}
+
+repo=${cmd##*-}
+owner=${SUDO_USER:-$USER}
+profile='base'
+chroots_iso="${CHROOTS_DIR}/buildiso"
+arch=$(uname -m)
+
+usage() {
+    echo "Usage: ${cmd} [options]"
+    echo "    -p <profile>       Profile [default: ${profile}]"
+    echo '    -r <dir>           Chroots directory'
+    echo "                       [default: ${chroots_iso}]"
+    echo '    -t <dir>           Target directory'
+    echo "                       [default: ${ISO_POOL}]"
+    echo '    -i <name>          Init system to use'
+    echo "                       [default: ${INITSYS}]"
+    echo '    -g <key>           The gpg key for img signing'
+    echo "                       [default: none]"
+    echo '    -m                 Set SquashFS image mode to persistence'
+    echo '    -c                 Disable clean work dir'
+    echo '    -x                 Build chroot only'
+    echo '    -s                 Squash chroot only'
+    echo '    -b                 Generate iso boot only'
+    echo '    -z                 Generate iso only'
+    echo '                       Requires pre built images (-x)'
+    echo '    -d                 Use dracut instead of mkinitcpio for iso initramfs'
+    echo '    -q                 Query settings and pretend build'
+    echo '    -h                 This help'
+    echo ''
+    echo ''
+    exit "$1"
+}
+
+opts='p:r:t:i:g:czsbxmdqh'
+
+while getopts "${opts}" arg; do
+    case "${arg}" in
+        p) profile="$OPTARG" ;;
+        r) chroots_iso="$OPTARG" ;;
+        t) ISO_POOL="$OPTARG" ;;
+        i) INITSYS="$OPTARG" ;;
+        g) GPG_KEY="$OPTARG" ;;
+        c) clean_first=false ;;
+        x) chroot_only=true ;;
+        z) iso_only=true ;;
+        s) squash_only=true ;;
+        b) boot_only=true ;;
+        m) persist=true ;;
+        d) use_dracut=true ;;
+        q) pretend=true ;;
+        h|?) usage 0 ;;
+        *) echo "invalid argument '${arg}'"; usage 1 ;;
+    esac
+done
+
+shift $(( OPTIND - 1 ))
+
+prepare_build
+
+${pretend} && display_settings && exit 1
+
+check_root
+
+prepare_dir "${mnt_dir}"
+prepare_dir "${iso_dir}"
+prepare_dir "${iso_root}"
+
+prepare_traps
+
+build

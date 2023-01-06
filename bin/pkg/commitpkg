@@ -1,0 +1,596 @@
+#!/bin/bash
+#
+# Copyright (C) 2018-19 artoo@artixlinux.org
+# Copyright (C) 2018 Artix Linux Developers
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+#!/hint/bash
+
+#{{{ base conf
+
+DATADIR=${DATADIR:-'/usr/share/artools'}
+SYSCONFDIR=${SYSCONFDIR:-'/etc/artools'}
+
+if [[ -n $SUDO_USER ]]; then
+    eval "USER_HOME=~$SUDO_USER"
+else
+    USER_HOME=$HOME
+fi
+
+USER_CONF_DIR="${XDG_CONFIG_HOME:-$USER_HOME/.config}/artools"
+
+prepare_dir(){
+    [[ ! -d $1 ]] && mkdir -p "$1"
+}
+
+load_base_config(){
+
+    local conf="$1/artools-base.conf"
+
+    [[ -f "$conf" ]] || return 1
+
+    # shellcheck source=/etc/artools/artools-base.conf
+    [[ -r "$conf" ]] && . "$conf"
+
+    CHROOTS_DIR=${CHROOTS_DIR:-'/var/lib/artools'}
+
+    WORKSPACE_DIR=${WORKSPACE_DIR:-"${USER_HOME}/artools-workspace"}
+
+    return 0
+}
+
+#}}}
+
+load_base_config "${USER_CONF_DIR}" || load_base_config "${SYSCONFDIR}"
+
+prepare_dir "${WORKSPACE_DIR}"
+prepare_dir "${USER_CONF_DIR}"
+
+#!/hint/bash
+
+#{{{ pkg conf
+
+load_pkg_config(){
+
+    local conf="$1/artools-pkg.conf"
+
+    [[ -f "$conf" ]] || return 1
+
+    # shellcheck source=/etc/artools/artools-pkg.conf
+    [[ -r "$conf" ]] && . "$conf"
+
+    local git_domain="gitea.artixlinux.org"
+
+    GIT_URL=${GIT_URL:-"https://${git_domain}"}
+
+    GIT_SSH=${GIT_SSH:-"gitea@${git_domain}"}
+
+    GIT_TOKEN=${GIT_TOKEN:-''}
+
+    TREE_DIR_ARTIX=${TREE_DIR_ARTIX:-"${WORKSPACE_DIR}/artixlinux"}
+
+    ARTIX_TREE=(
+        packages community
+        packages-{gfx,media,net}
+    )
+
+    local dev_tree=(
+        packages-{llvm,python,perl,java,ruby,misc}
+        python-{world,galaxy,galaxy-groups,misc}
+    )
+
+    local init_tree=(packages-{openrc,runit,s6,suite66,dinit})
+
+    local desktop_tree=(
+        packages-{kf5,plasma,kde,qt5,qt6,xorg,gtk}
+        packages-{lxqt,gnome,cinnamon,mate,xfce,wm,lxde}
+    )
+
+    [[ -z ${TREE_NAMES_ARTIX[*]} ]] && \
+    TREE_NAMES_ARTIX=(
+        packages-kernel
+        "${init_tree[@]}"
+        "${dev_tree[@]}"
+        "${desktop_tree[@]}"
+        packages-devel
+        packages-lib32
+    )
+
+    ARTIX_TREE+=("${TREE_NAMES_ARTIX[@]}")
+
+    TREE_DIR_ARCH=${TREE_DIR_ARCH:-"${WORKSPACE_DIR}/archlinux"}
+
+    [[ -z ${ARCH_TREE[*]} ]] && \
+    ARCH_TREE=(svntogit-{packages,community})
+
+    REPOS_ROOT=${REPOS_ROOT:-"${WORKSPACE_DIR}/repos"}
+
+    REPOS_MIRROR=${REPOS_MIRROR:-'http://mirror1.artixlinux.org/repos'}
+
+    HOST_TREE_ARCH=${HOST_TREE_ARCH:-'https://github.com/archlinux'}
+
+    DBEXT=${DBEXT:-'gz'}
+
+    return 0
+}
+
+#}}}
+
+load_pkg_config "${USER_CONF_DIR}" || load_pkg_config "${SYSCONFDIR}"
+
+prepare_dir "${REPOS_ROOT}"
+prepare_dir "${TREE_DIR_ARTIX}"
+prepare_dir "${TREE_DIR_ARCH}"
+
+#!/hint/bash
+
+#{{{ message
+
+#set +u +o posix
+
+# shellcheck disable=1091
+. /usr/share/makepkg/util.sh
+
+export LANG=C
+
+shopt -s extglob
+
+if [[ -t 2 && "$TERM" != dumb ]]; then
+    colorize
+else
+    # shellcheck disable=2034
+    declare -gr ALL_OFF='' BOLD='' BLUE='' GREEN='' RED='' YELLOW=''
+fi
+
+stat_busy() {
+    local mesg=$1; shift
+    # shellcheck disable=2059
+    printf "${GREEN}==>${ALL_OFF}${BOLD} ${mesg}...${ALL_OFF}" "$@" >&2
+}
+
+stat_done() {
+    # shellcheck disable=2059
+    printf "${BOLD}done${ALL_OFF}\n" >&2
+}
+
+lock_close() {
+	local fd=$1
+	exec {fd}>&-
+}
+
+lock() {
+    if ! [[ "/dev/fd/$1" -ef "$2" ]]; then
+        mkdir -p -- "$(dirname -- "$2")"
+        eval "exec $1>"'"$2"'
+    fi
+    if ! flock -n "$1"; then
+        stat_busy "$3"
+        flock "$1"
+        stat_done
+    fi
+}
+
+slock() {
+    if ! [[ "/dev/fd/$1" -ef "$2" ]]; then
+        mkdir -p -- "$(dirname -- "$2")"
+        eval "exec $1>"'"$2"'
+    fi
+    if ! flock -sn "$1"; then
+        stat_busy "$3"
+        flock -s "$1"
+        stat_done
+    fi
+}
+
+_setup_workdir=false
+setup_workdir() {
+    [[ -z ${WORKDIR:-} ]] && WORKDIR=$(mktemp -d --tmpdir "${0##*/}.XXXXXXXXXX")
+    _setup_workdir=true
+    trap 'trap_abort' INT QUIT TERM HUP
+    trap 'trap_exit' EXIT
+}
+
+trap_abort() {
+    trap - EXIT INT QUIT TERM HUP
+    abort
+}
+
+trap_exit() {
+    local r=$?
+    trap - EXIT INT QUIT TERM HUP
+    cleanup $r
+}
+
+cleanup() {
+    if [[ -n ${WORKDIR:-} ]] && $_setup_workdir; then
+        rm -rf "$WORKDIR"
+    fi
+    exit "${1:-0}"
+}
+
+abort() {
+    error 'Aborting...'
+    cleanup 255
+}
+
+die() {
+    (( $# )) && error "$@"
+    cleanup 255
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ common functions
+
+get_compliant_name(){
+    local gitname="$1"
+    case "$gitname" in
+        *+) gitname=${gitname//+/plus}
+    esac
+    echo "$gitname"
+}
+
+get_pkg_org(){
+    local pkg="$1" org sub
+    case ${pkg} in
+        ruby-*) org="packagesRuby" ;;
+        perl-*) org="packagesPerl" ;;
+        python-*|python2-*) org="packagesPython" ;;
+        *) sub=${pkg:0:1}; org="packages${sub^^}" ;;
+    esac
+    echo "$org"
+}
+
+api_put() {
+    curl -s -X PUT "$@"
+}
+
+api_delete() {
+    curl -s -X DELETE "$@"
+}
+
+api_post() {
+    curl -s -X POST "$@"
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ git
+
+get_local_head(){
+    git log --pretty=%H ...refs/heads/master^ | head -n 1
+}
+
+get_remote_head(){
+    git ls-remote origin -h refs/heads/master | cut -f1
+}
+
+has_changeset(){
+    local head_l="$1" head_r="$2"
+    if [[ "$head_l" == "$head_r" ]]; then
+        msg2 "remote changes: no"
+        return 1
+    else
+        msg2 "remote changes: yes"
+        return 0
+    fi
+}
+
+pull_tree(){
+    local tree="$1" local_head="$2" os="${3:-Artix}"
+    local remote_head
+    remote_head=$(get_remote_head)
+
+    msg "Checking (%s) (%s)" "${tree}" "$os"
+    if has_changeset "${local_head}" "${remote_head}";then
+        git pull origin master
+    fi
+}
+
+#}}}
+
+#!/hint/bash
+
+#{{{ gitea api
+
+add_team_to_repo() {
+    local name="$1"
+    local org="$2"
+    local team="$3"
+    local url
+
+    url="${GIT_URL}/api/v1/repos/$org/$name/teams/$team?access_token=${GIT_TOKEN}"
+
+    msg2 "Adding team (%s) to package repo [%s]" "$team" "$name"
+
+    api_put "$url" -H  "accept: application/json"
+}
+
+remove_team_from_repo() {
+    local name="$1"
+    local org="$2"
+    local team="$3"
+    local url
+
+    url="${GIT_URL}/api/v1/repos/$org/$name/teams/$team?access_token=${GIT_TOKEN}"
+
+    msg2 "Removing team (%s) from package repo [%s]" "$team" "$name"
+
+    api_delete "$url" -H  "accept: application/json"
+}
+
+#}}}
+
+#!/hint/bash
+
+##{{{ repo
+
+shopt -s extglob
+
+load_valid_names(){
+    local conf
+    conf="${DATADIR}"/valid-names.conf
+    [[ -f "$conf" ]] || return 1
+    # shellcheck source=/usr/share/artools/valid-names.conf
+    [[ -r "$conf" ]] && . "$conf"
+    return 0
+}
+
+set_arch_repos(){
+    local _testing="$1" _staging="$2" _unstable="$3"
+    [[ -z ${valid_names[*]} ]] && load_valid_names
+    ARCH_REPOS=("${stable[@]}")
+    $_testing && ARCH_REPOS+=("${gremlins[@]}")
+    $_staging && ARCH_REPOS+=("${goblins[@]}")
+    $_unstable && ARCH_REPOS+=("${wobble[@]}")
+}
+
+find_repo(){
+    local pkg="$1" pkgarch="${2:-${CARCH}}" repo
+    for r in "${ARCH_REPOS[@]}"; do
+        [[ -f $pkg/repos/$r-$pkgarch/PKGBUILD ]] && repo=repos/"$r-$pkgarch"
+        [[ -f $pkg/repos/$r-any/PKGBUILD ]] && repo=repos/"$r"-any
+        [[ -f $pkg/$pkgarch/$r/PKGBUILD ]] && repo="$pkgarch/$r"
+    done
+    echo "$repo"
+}
+
+find_pkg(){
+    local searchdir="$1" pkg="$2" result
+    result=$(find "$searchdir" -mindepth 2 -maxdepth 2 -type d -name "$pkg")
+    echo "$result"
+}
+
+tree_loop(){
+    local func="$1" pkgs
+    for tree in "${ARTIX_TREE[@]}"; do
+        pkgs=$(find "${TREE_DIR_ARTIX}/$tree" -name "$CARCH" | sort)
+        for _package in ${pkgs}; do
+            "$func" "$_package"
+        done
+    done
+}
+
+#}}}
+
+
+#{{{ functions
+
+push_tree(){
+    local tree="$1"
+    msg "Update (%s)" "${tree}"
+    git push origin master
+}
+
+subrepo_push(){
+    local pkg="$1"
+    msg2 "Subrepo push (%s)" "$pkg"
+    git subrepo push "$pkg" || die "%s push failed" "$pkg"
+}
+
+subrepo_clean(){
+    local pkg="$1"
+    msg2 "Subrepo clean (%s)" "$pkg"
+    git subrepo clean "$pkg"
+}
+
+subrepo_pull(){
+    local pkg="$1"
+    msg2 "Subrepo pull (%s)" "$pkg"
+    git subrepo pull "$pkg"
+}
+
+check_rebuild(){
+    if [[ -d "$CARCH"/"${valid_names[10]}" ]] \
+    && [[ "${repo_dest}" == "${valid_names[7]}" ]]; then
+        git rm -r "$CARCH"/"${valid_names[10]}"
+        git commit -m "switch from ${valid_names[10]} to ${valid_names[7]}"
+    elif [[ -d "$CARCH"/"${valid_names[7]}" ]] \
+    && [[ "${repo_dest}" == "${valid_names[10]}" ]]; then
+        git rm -r "$CARCH"/"${valid_names[7]}"
+        git commit -m "switch from ${valid_names[7]} to ${valid_names[10]}"
+    fi
+}
+
+check_team(){
+    if [[ "${repo_src}" == "${valid_names[0]}" && "${repo_dest}" == "${valid_names[1]}" ]] || \
+        [[ "${repo_src}" == "${valid_names[1]}" && "${repo_dest}" == "${valid_names[0]}" ]] || \
+        [[ "${repo_src}" == "${valid_names[1]}" && "${repo_dest}" == "${valid_names[2]}" ]] || \
+        [[ "${repo_src}" == "${valid_names[2]}" && "${repo_dest}" == "${valid_names[1]}" ]] || \
+        [[ "${repo_src}" == "${valid_names[0]}" && "${repo_dest}" == "${valid_names[2]}" ]] || \
+        [[ "${repo_src}" == "${valid_names[2]}" && "${repo_dest}" == "${valid_names[0]}" ]]; then
+
+        local org gitname
+        org=$(get_pkg_org "${package}")
+        gitname=$(get_compliant_name "${package}")
+        add_team_to_repo "$gitname" "${org}" "${repo_dest}"
+        remove_team_from_repo "$gitname" "${org}" "${repo_src}"
+    fi
+}
+
+path_config() {
+    [[ "${repo_src}" != 'trunk' ]] && pkgbuild="$CARCH/${repo_src}"/PKGBUILD
+
+    # shellcheck disable=1090
+    . "$pkgbuild"
+}
+
+get_repo_commit_msg() {
+    echo "[${repo_src}] -> [${repo_dest}] '${package}-$(get_full_version)' ${action}"
+}
+
+get_commit_msg() {
+    echo "[${repo_src}] '${package}-$(get_full_version)' ${action}"
+}
+
+commit_pkg() {
+    local commit_msg pkg
+    if ${remove}; then
+        action='remove'
+        commit_msg=$(get_commit_msg)
+        msg "Action: %s" "$commit_msg"
+        if [[ "${repo_src}" == 'trunk' ]];then
+            git rm -r trunk
+        else
+            git rm -r "$CARCH/${repo_src}"
+        fi
+    else
+        action='modify'
+        commit_msg=$(get_commit_msg)
+        msg "Action: %s" "$commit_msg"
+        git add .
+    fi
+    git commit -m "$commit_msg"
+}
+
+repo_commit_pkg() {
+    local commit_msg
+
+    [[ -d "$CARCH/${repo_dest}" ]] && git rm -r "$CARCH/${repo_dest}"
+    [[ ! -d "$CARCH" ]] && mkdir "$CARCH"
+    [[ ! -d "$CARCH/${repo_dest}" ]] && mkdir "$CARCH/${repo_dest}"
+
+    if [[ "${repo_src}" == 'trunk' ]]; then
+        action='add'
+        commit_msg=$(get_repo_commit_msg)
+        msg "Action: %s" "$commit_msg"
+        check_rebuild
+        cp trunk/* "$CARCH/${repo_dest}"/
+    else
+        action='move'
+        [[ ! -f $pkgbuild ]] && die "%s does not exist!" "$pkgbuild"
+        commit_msg=$(get_repo_commit_msg)
+        msg "Action: %s" "$commit_msg"
+        cp "$CARCH/${repo_src}"/* "$CARCH/${repo_dest}"/
+        git rm -r "$CARCH/${repo_src}"
+    fi
+    git add .
+    git commit -m "$commit_msg"
+}
+
+run(){
+    local artixpath head group
+    artixpath=$(find_pkg "${TREE_DIR_ARTIX}" "${package}")
+    if [[ -n ${artixpath} ]];then
+        group=${artixpath%/*}
+        cd "${group}" || return
+        head=$(get_local_head)
+
+        cd "${artixpath}" || return
+
+        path_config
+
+        if [[ "${cmd}" == 'commitpkg' ]];then
+            commit_pkg
+        else
+            repo_commit_pkg
+        fi
+
+        cd "${group}" || return
+
+        ${push} && pull_tree "${group##*/}" "$head"
+#         subrepo_pull "${package}"
+        subrepo_push "${package}"
+        subrepo_clean "${package}"
+
+        ${push} && push_tree "${group##*/}"
+
+        git prune
+
+        [[ "${cmd}" != 'commitpkg' ]] && check_team
+    else
+        die "Package '%s' does not exist!" "${package}"
+    fi
+}
+
+is_valid_repo(){
+    local _valid=trunk
+    for repo in "${valid_names[@]}"; do
+        _valid=${repo:-}${repo:+|}$_valid
+    done
+    eval "case ${repo_src} in
+        ${_valid}) return 0 ;;
+        *) return 1 ;;
+    esac"
+}
+
+#}}}
+
+load_makepkg_config
+
+load_valid_names
+
+repo_src='trunk'
+package=''
+remove=false
+push=false
+
+pkgbuild=trunk/PKGBUILD
+
+cmd=${0##*/}
+repo_dest=${cmd%pkg}
+
+usage() {
+    echo "Usage: ${0##*/} [options]"
+    echo "    -s <name>          Source repository [default:${repo_src}]"
+    echo '    -p <pkg>           Package name'
+    echo '    -r                 Delete from repo (commitpkg only)'
+    echo '    -u                 Push'
+    echo '    -h                 This help'
+    echo ''
+    echo ''
+    exit "$1"
+}
+
+opts='p:s:urh'
+
+while getopts "${opts}" arg; do
+    case "${arg}" in
+        s) repo_src="$OPTARG" ;;
+        p) package="$OPTARG" ;;
+        r) remove=true ;;
+        u) push=true ;;
+        h|?) usage 0 ;;
+        *) echo "invalid argument '${arg}'"; usage 1 ;;
+    esac
+done
+
+shift $(( OPTIND - 1 ))
+
+if is_valid_repo;then
+    run
+else
+    die "source repository '%s' is not valid!" "${repo_src}"
+fi
